@@ -203,23 +203,40 @@ class PlaybackGuard extends ChangeNotifier {
 
   /// 外部输出路由重新确认可用（设备回连/插入）。
   ///
-  /// 返回是否解除了「断连暂停」的挂起（即此前因断连暂停、且该设备
-  /// 已成为当前媒体输出）。调用方据此决定是否以 automatic 来源重试播放。
+  /// 返回是否产生了「可自动恢复」的唤醒信号：
+  /// - 断连暂停：路由回来了，解除挂起（配合 autoResumeAfterInterruption
+  ///   决定是否真的恢复）；
+  /// - B4 场景：打断结束后的自动恢复因「路由尚未回到耳机」被 defer，
+  ///   现在路由恢复——唤醒该次被推迟的恢复。
   bool recordRouteReady(AudioRouteSnapshot snapshot) {
-    if (_lastPause == PauseCause.disconnect) {
-      final atPause = _routeAtPause;
-      // 暂停时的路由已回来（或无法判定时宽松放行）：
-      // 恢复资格满足，但是否真的恢复还由 decide 决定。
-      if (atPause == null ||
-          !atPause.known ||
-          !snapshot.known ||
-          atPause.hasExternalOutput == snapshot.hasExternalOutput ||
-          snapshot.hasExternalOutput) {
-        _resumeAfterInterruption = true;
-        return true;
-      }
+    switch (_lastPause) {
+      case PauseCause.disconnect:
+        final atPause = _routeAtPause;
+        if (atPause == null ||
+            !atPause.known ||
+            !snapshot.known ||
+            atPause.hasExternalOutput == snapshot.hasExternalOutput ||
+            snapshot.hasExternalOutput) {
+          _resumeAfterInterruption = true;
+          return true;
+        }
+        return false;
+      case PauseCause.interruption:
+        // B4：恢复被推迟（通话结束时路由未回耳机），现在路由回来了。
+        final atPause = _routeAtPause;
+        if (atPause != null &&
+            atPause.known &&
+            atPause.hasExternalOutput &&
+            snapshot.hasExternalOutput) {
+          _resumeAfterInterruption = true;
+          return true;
+        }
+        return false;
+      case null:
+      case PauseCause.user:
+      case PauseCause.completion:
+        return false;
     }
-    return false;
   }
 
   /// 播放闸门：给定来源与当前路由，裁决是否允许出声。

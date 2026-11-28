@@ -25,6 +25,9 @@ class _Session extends Fake implements AudioSession {
   final devicesChanged =
       StreamController<AudioDevicesChangedEvent>.broadcast();
 
+  /// 可变的设备集合：模拟耳机/蓝牙连接状态。
+  Set<AudioDevice> currentDevices = {};
+
   @override
   Stream<AudioInterruptionEvent> get interruptionEventStream =>
       interruptions.stream;
@@ -41,13 +44,63 @@ class _Session extends Fake implements AudioSession {
   Future<Set<AudioDevice>> getDevices({
     bool includeInputs = true,
     bool includeOutputs = true,
-  }) async => {};
+  }) async => currentDevices;
 
   void interrupt(
     bool begin, [
     AudioInterruptionType type = AudioInterruptionType.pause,
   ]) {
     interruptions.add(AudioInterruptionEvent(begin, type));
+  }
+
+  void removeExternalDevices() {
+    final removed = currentDevices.where(_isMediaOutputDevice).toSet();
+    currentDevices = currentDevices.difference(removed);
+    devicesChanged.add(AudioDevicesChangedEvent(
+      devicesAdded: const {},
+      devicesRemoved: removed,
+    ));
+  }
+
+  void addBluetoothMediaDevice() {
+    final device = AudioDevice(
+      id: 'bt-media',
+      name: 'BT Media',
+      isInput: false,
+      isOutput: true,
+      // ignore: experimental_member_use
+      type: AudioDeviceType.bluetoothA2dp,
+    );
+    currentDevices = {...currentDevices, device};
+    devicesChanged.add(AudioDevicesChangedEvent(
+      devicesAdded: {device},
+      devicesRemoved: const {},
+    ));
+  }
+
+  void addScoOnlyDevice() {
+    final device = AudioDevice(
+      id: 'bt-sco',
+      name: 'BT SCO',
+      isInput: true,
+      isOutput: true,
+      // ignore: experimental_member_use
+      type: AudioDeviceType.bluetoothSco,
+    );
+    currentDevices = {...currentDevices, device};
+    devicesChanged.add(AudioDevicesChangedEvent(
+      devicesAdded: {device},
+      devicesRemoved: const {},
+    ));
+  }
+
+  static bool _isMediaOutputDevice(AudioDevice d) {
+    // ignore: experimental_member_use
+    return d.type == AudioDeviceType.bluetoothA2dp ||
+        // ignore: experimental_member_use
+        d.type == AudioDeviceType.wiredHeadset ||
+        // ignore: experimental_member_use
+        d.type == AudioDeviceType.wiredHeadphones;
   }
 
   Future<void> close() async {
@@ -940,5 +993,123 @@ void main() {
     await pending;
     expect(handler.audioPlayer.playing, isFalse);
     expect(handler.automaticPlays, 0);
+  });
+
+  // ============================================================
+  // C3 路由层：设备移除兜底 / 恢复路由校验 / 连接自动播放收紧。
+  // 路由监听只在移动平台启动，这组用例局部覆盖为 android。
+  // ============================================================
+  group('route-aware playback', () {
+    late _Session routeSession;
+    late _Handler routeHandler;
+    late PlayerController routePlayer;
+
+    setUp(() {
+      // 路由监听只在移动平台启动；PlayerController 的会话装配发生在
+      // 构造期，因此先覆盖平台再自建独立的 player（不复用全局 windows
+      // 环境下构造的那个）。
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      routeSession = _Session();
+      routeHandler = _Handler();
+      routePlayer = PlayerController(
+        api,
+        routeHandler,
+        audioSessionProvider: () async => routeSession,
+      );
+      routePlayer.currentSong = const Song(
+        id: '1',
+        title: 'Route',
+        artist: 'Artist',
+        hash: 'ROUTE',
+      );
+    });
+
+    tearDown(() async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+      await Future<void>.delayed(Duration.zero);
+      routePlayer.dispose();
+      await routeSession.close();
+    });
+
+    test('设备移除且无 becomingNoisy 时兜底暂停（B2）', () async {
+      await Future<void>.delayed(Duration.zero);
+      routeSession.addBluetoothMediaDevice();
+      routeHandler.audioPlayer.setPlaying(true);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+
+      // 只有设备移除事件，不发 noisy 广播。
+      routeSession.removeExternalDevices();
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 兜底暂停后不得自动恢复（扬声器上绝不续播）。
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+      expect(routeHandler.automaticPlays, 0);
+    });
+
+    test('断连暂停后重连耳机自动恢复（I1）', () async {
+      await Future<void>.delayed(Duration.zero);
+      routeSession.addBluetoothMediaDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      routeHandler.audioPlayer.setPlaying(true);
+      routeSession.noisy.add(null);
+      await Future<void>.delayed(Duration.zero);
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 蓝牙耳机重新连接并确认路由生效。
+      routeSession.addBluetoothMediaDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+      expect(routeHandler.audioPlayer.playing, isTrue);
+      expect(routeHandler.automaticPlays, 1);
+    });
+
+    test('通话结束后路由未回耳机不恢复，回连后唤醒（B4）', () async {
+      await Future<void>.delayed(Duration.zero);
+      routeSession.addBluetoothMediaDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      routeHandler.audioPlayer.setPlaying(true);
+
+      // 通话开始（此时路由还在蓝牙耳机上）。
+      routeSession.interrupt(true);
+      await Future<void>.delayed(Duration.zero);
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 通话中耳机断开（A2DP 让位给通话/被关闭）。
+      routeSession.removeExternalDevices();
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+
+      // 通话结束：路由还在扬声器 → 恢复被 defer，不得外放。
+      routeSession.interrupt(false);
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 耳机回连：被推迟的恢复唤醒。
+      routeSession.addBluetoothMediaDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+      expect(routeHandler.audioPlayer.playing, isTrue);
+      expect(routeHandler.automaticPlays, 1);
+    });
+
+    test('只连通话通道的蓝牙不触发自动播放（B5）', () async {
+      await Future<void>.delayed(Duration.zero);
+      routePlayer.autoPlayOnDeviceConnected = true;
+
+      // SCO 设备出现：不算媒体输出，不产生 ready 信号。
+      routeSession.addScoOnlyDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+      expect(routeHandler.automaticPlays, 0);
+    });
+
+    test('连接确认后的蓝牙设备可自动播放（B5 正向）', () async {
+      await Future<void>.delayed(Duration.zero);
+      routePlayer.autoPlayOnDeviceConnected = true;
+
+      routeSession.addBluetoothMediaDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+      expect(routeHandler.audioPlayer.playing, isTrue);
+      expect(routeHandler.automaticPlays, 1);
+    });
   });
 }

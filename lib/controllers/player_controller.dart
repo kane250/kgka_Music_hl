@@ -369,8 +369,7 @@ class PlayerController extends ChangeNotifier {
   late final StreamSubscription<int?> _androidAudioSessionSub;
   StreamSubscription<AudioInterruptionEvent>? _interruptionSub;
   StreamSubscription<void>? _becomingNoisySub;
-  StreamSubscription<Set<AudioDevice>>? _devicesSub;
-  Set<AudioDevice>? _previousDevices;
+  StreamSubscription<AudioRouteChange>? _routeChangeSub;
   final Stopwatch _positionClock = Stopwatch();
   // 平滑位置的上一次取值：用于过滤位置流的小幅倒退（音频缓冲/时钟抖动），
   // 避免歌词高亮和卡拉OK进度出现回跳。seek/换歌的大跨度回退会重建基线。
@@ -1902,6 +1901,8 @@ class PlayerController extends ChangeNotifier {
     try {
       final session = await _audioSessionProvider();
       await session.configure(_audioSessionConfiguration);
+      // 路由快照源：桌面等不支持的平台保持 unknown（闸门不做路由拦截）。
+      unawaited(_routeMonitor.start());
       _interruptionSub = session.interruptionEventStream.listen((event) {
         if (event.begin) {
           _autoResumeTimer?.cancel();
@@ -1968,82 +1969,98 @@ class PlayerController extends ChangeNotifier {
         }
       });
       _becomingNoisySub = session.becomingNoisyEventStream.listen((_) {
-        final route = _currentRouteSnapshot();
-        if (autoPauseOnDeviceDisconnect) {
-          // 断开即暂停（默认开启）：立即停下并记录「因断连暂停」。
-          // 该挂起只在路由回连（ready）时解除——绝不从扬声器自动续播
-          // （I1/B2/B4/B6）。
-          _cancelAutomaticResume();
-          // 先暂停再恢复 duck 音量，避免拔耳机瞬间满音量爆音（B8）。
-          unawaited(_audioHandler.pause(userInitiated: false));
-          _restoreDuckedVolume();
-          _guard.recordPause(PauseCause.disconnect, route);
-          return;
-        }
-        // B7 修复：断连后的行为不再与「阻止打断」开关耦合。
-        // 原实现里「阻止打断 + 关闭断开暂停」会完全忽略拔耳机，
-        // 音乐从扬声器继续放；现在无论焦点策略如何都走暂停，
-        // 仅在开启 autoResumeAfterInterruption 时按兼容旧行为恢复。
-        final wasPlaying =
-            audioPlayer.playing ||
-            _pendingPlaybackIntent == _playbackIntentSerial;
-        unawaited(_audioHandler.pause(userInitiated: false));
-        if (wasPlaying) {
-          // 兼容旧行为：按打断语义记录，随后可恢复（含在扬声器上恢复，
-          // 这是用户显式关闭「断开停止播放」后选择的行为）。
-          _guard.recordPause(PauseCause.interruption, route);
-          if (autoResumeAfterInterruption && currentSong != null) {
-            _scheduleAutomaticResume(const Duration(milliseconds: 500));
-          }
-        }
+        _handleRouteAbandoned('becomingNoisy');
       });
-      _previousDevices = await session.getDevices();
-      _devicesSub = session.devicesStream.listen((devices) {
-        if (_previousDevices != null) {
-          final addedDevices = devices.difference(_previousDevices!);
-          if (addedDevices.isNotEmpty) {
-            // ignore: experimental_member_use
-            final hasNewAudioDevice = addedDevices.any(
-              (d) =>
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.bluetoothA2dp ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.bluetoothLe ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.bluetoothSco ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.wiredHeadset ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.wiredHeadphones ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.carAudio,
-            );
-
-            if (hasNewAudioDevice &&
-                autoPlayOnDeviceConnected &&
-                currentSong != null &&
-                !audioPlayer.playing &&
-                _guard.focus == InterruptionPhase.none) {
-              // 设备重新出现：解除断连挂起（B5 的 isOutput/SCO 校验
-              // 由 C3 的 AudioRouteMonitor ready 事件接管）。
-              _guard.resolveDisconnectHold();
-              _scheduleAutomaticResume(const Duration(milliseconds: 500));
-            }
-            if (hasNewAudioDevice) {
-              // 车机刚建立连接时接收端可能尚未注册完成：先主动刷新一次，
-              // 再延迟补发一次，避免第二次连接后一直收不到歌词（#161）。
-              _announceBluetoothLyrics();
-              _scheduleBluetoothLyricsAnnouncement();
-            }
-          }
-        }
-        _previousDevices = devices;
-      });
+      // 设备层由 AudioRouteMonitor 接管：becomingNoisy 快通道之外
+      // 新增设备移除兜底（B2），新增输出设备防抖确认为 ready（B5）。
+      // 原有 devicesStream 全量差集 + 不查 isOutput/含 SCO 的旧实现废弃。
+      _routeChangeSub = _routeMonitor.changes.listen(_handleRouteChange);
     } catch (error) {
       // AudioSession 不可用（桌面平台等）：记录日志并保持 guard 的
       // unknown 路由策略，不再静默丢弃（B8）。
       debugPrint('[KA Music][audio] setup listeners failed: $error');
     }
+  }
+
+  /// 路由事件分发（AudioRouteMonitor 的唯一消费入口）。
+  void _handleRouteChange(AudioRouteChange change) {
+    switch (change.reason) {
+      case AudioRouteChangeReason.abandoned:
+        // becomingNoisy 缺席时的兜底通道（B2）：与快通道同一处理，幂等。
+        _handleRouteAbandoned(change.context ?? 'device-removed');
+      case AudioRouteChangeReason.ready:
+        _handleRouteReady(change);
+      case AudioRouteChangeReason.snapshot:
+        // 快照刷新不需要动作：decide 在每次播放时实时读取当前路由。
+        break;
+    }
+  }
+
+  /// 外部媒体输出丢失（拔耳机/蓝牙断开）：暂停并记录断连挂起。
+  ///
+  /// becomingNoisy 快通道与设备移除兜底通道共用；重复触发幂等。
+  void _handleRouteAbandoned(String source) {
+    final route = _currentRouteSnapshot();
+    if (autoPauseOnDeviceDisconnect) {
+      // 断开即暂停（默认开启）：立即停下并记录「因断连暂停」。
+      // 该挂起只在路由回连（ready）时解除——绝不从扬声器自动续播
+      // （I1/B2/B4/B6）。
+      _cancelAutomaticResume();
+      // 先暂停再恢复 duck 音量，避免拔耳机瞬间满音量爆音（B8）。
+      unawaited(_audioHandler.pause(userInitiated: false));
+      _restoreDuckedVolume();
+      _guard.recordPause(PauseCause.disconnect, route);
+      return;
+    }
+    // B7 修复：断连后的行为不再与「阻止打断」开关耦合。
+    // 原实现里「阻止打断 + 关闭断开暂停」会完全忽略拔耳机，
+    // 音乐从扬声器继续放；现在无论焦点策略如何都走暂停，
+    // 仅在开启 autoResumeAfterInterruption 时按兼容旧行为恢复。
+    final wasPlaying =
+        audioPlayer.playing ||
+        _pendingPlaybackIntent == _playbackIntentSerial;
+    unawaited(_audioHandler.pause(userInitiated: false));
+    if (wasPlaying) {
+      // 兼容旧行为：按打断语义记录，随后可恢复（含在扬声器上恢复，
+      // 这是用户显式关闭「断开停止播放」后选择的行为）。
+      _guard.recordPause(PauseCause.interruption, route);
+      if (autoResumeAfterInterruption && currentSong != null) {
+        _scheduleAutomaticResume(const Duration(milliseconds: 500));
+      }
+    }
+  }
+
+  /// 外部输出确认可用（重连/插入，经防抖确认）。
+  ///
+  /// 三件事（B4/B5）：
+  /// 1. 解除断连挂起：断连暂停后的自动续播在此恢复资格；
+  ///    deferred 的恢复（通话结束但 A2DP 未回等）也由这里唤醒重试；
+  /// 2. 连接新设备自动播放：ready 已含 isOutput + 非 SCO-only 确认，
+  ///    修复旧实现「设备出现≠路由生效/SCO 输入也触发」的缺陷；
+  /// 3. 车机歌词公告：设备就绪后主动刷新（#161）。
+  void _handleRouteReady(AudioRouteChange change) {
+    final disconnectResolved = _guard.recordRouteReady(change.snapshot);
+
+    // 断连暂停后的自动续播（含 B4 的 deferred 唤醒）。
+    if (disconnectResolved &&
+        autoResumeAfterInterruption &&
+        currentSong != null &&
+        !audioPlayer.playing) {
+      _scheduleAutomaticResume(const Duration(milliseconds: 300));
+    }
+
+    // 连接新设备自动播放（用户显式开启才生效）。
+    if (autoPlayOnDeviceConnected &&
+        currentSong != null &&
+        !audioPlayer.playing &&
+        _guard.focus == InterruptionPhase.none) {
+      _scheduleAutomaticResume(const Duration(milliseconds: 300));
+    }
+
+    // 车机刚建立连接时接收端可能尚未注册完成：先主动刷新一次，
+    // 再延迟补发一次，避免第二次连接后一直收不到歌词（#161）。
+    _announceBluetoothLyrics();
+    _scheduleBluetoothLyricsAnnouncement();
   }
 
   void _cancelAutomaticResume() {
@@ -3154,7 +3171,7 @@ class PlayerController extends ChangeNotifier {
     _androidAudioSessionSub.cancel();
     _interruptionSub?.cancel();
     _becomingNoisySub?.cancel();
-    _devicesSub?.cancel();
+    _routeChangeSub?.cancel();
     _routeMonitor.dispose();
     _completionFallbackTimer?.cancel();
     unawaited(
