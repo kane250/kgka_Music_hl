@@ -167,6 +167,18 @@ class PlaybackGuard extends ChangeNotifier {
   /// 打断暂停仅在当前无更具体原因时记录。
   void recordPause(PauseCause cause, AudioRouteSnapshot currentRoute) {
     if (cause == PauseCause.user) {
+      // 真机实测（PR#1 验收）：MIUI/AVRCP 在蓝牙断开时会给
+      // MediaSession 补发一条 pause 命令，经 handler 默认参数被
+      // 当成「用户暂停」——若据此改写归因，断连保护立即失效，
+      // 随后的媒体键 PLAY 被放行到扬声器外放。
+      // 断连挂起一经建立，只有用户显式播放（recordUserPlay）
+      // 可以解除，系统转发的暂停命令不得覆盖。
+      if (_lastPause == PauseCause.disconnect) {
+        debugPrint(
+          '[KA Music][gate] user pause ignored (disconnect hold active)',
+        );
+        return;
+      }
       _resumeAfterInterruption = false;
       _lastPause = cause;
       _routeAtPause = currentRoute;
