@@ -19,6 +19,8 @@ import '../services/desktop_lyrics_service.dart';
 import '../services/music_api.dart';
 import '../services/local_lyrics_service.dart';
 import '../services/music_audio_handler.dart';
+import '../services/audio_route_monitor.dart';
+import '../services/playback_guard.dart';
 import '../services/bluetooth_lyrics_service.dart';
 import '../services/playback_history_service.dart';
 import '../services/playback_stats_service.dart';
@@ -210,6 +212,9 @@ class PlayerController extends ChangeNotifier {
   /// 就会出现「当前歌曲已保存、队列没保存」的残缺状态：重启后只剩一首歌，
   /// 点「下一首」永远原地不动，必须重新进歌单点播才能恢复。
   static const _stateKey = 'playback.state_snapshot';
+  /// 断连暂停持久化（B6）：进程被杀/重启后自启动流程读到它
+  /// 就不自动播放，保证「拔耳机→暂停」的保护跨重启仍然 fail-closed。
+  static const _disconnectPauseKey = 'playback.paused_by_disconnect';
   static const _queueSaveDebounceMs = 500;
   static const _positionSaveInterval = Duration(seconds: 5);
   static const _listenTimeReportInterval = Duration(minutes: 5);
@@ -267,8 +272,12 @@ class PlayerController extends ChangeNotifier {
     _audioHandler.attachTransportControls(
       onNext: next,
       onPrevious: previous,
-      onPause: _cancelAutomaticResume,
+      onPause: _handleExternalPause,
       onPlay: _handleManualPlay,
+    );
+    // 系统媒体会话（耳机键/车机/锁屏）直达 play()，必须过同一套闸门。
+    _audioHandler.attachPlaybackGate(
+      (origin) => _guard.decide(origin, _currentRouteSnapshot()),
     );
     _desktopLyrics.setVisibilityChangedHandler(_handleDesktopLyricsVisibility);
     _positionSub = audioPlayer.positionStream.listen((value) {
@@ -296,12 +305,20 @@ class PlayerController extends ChangeNotifier {
       notifyListeners();
     });
     _stateSub = audioPlayer.playerStateStream.listen((value) {
+      final wasPlaying = isPlaying;
       isPlaying = value.playing;
       isBuffering =
           value.processingState == ProcessingState.loading ||
           value.processingState == ProcessingState.buffering;
       if (!_isSeeking) {
         _setPositionBase(audioPlayer.position, playing: isPlaying);
+      }
+      // 引擎在无本应用暂停请求的情况下停止：极可能是系统因路由变化
+      // （拔耳机/蓝牙断开）直接停掉 AudioTrack（MIUI 等不发 becomingNoisy
+      // 且设备事件可能缺席）。真机实测发现这条被动路径会让断连完全
+      // 无归因，媒体键 PLAY 被放行到扬声器外放——必须在此完成归因。
+      if (!value.playing && wasPlaying) {
+        unawaited(_detectUnexpectedEnginePause());
       }
       _syncListeningTimeTracker();
       _syncDesktopPlayState();
@@ -363,8 +380,7 @@ class PlayerController extends ChangeNotifier {
   late final StreamSubscription<int?> _androidAudioSessionSub;
   StreamSubscription<AudioInterruptionEvent>? _interruptionSub;
   StreamSubscription<void>? _becomingNoisySub;
-  StreamSubscription<Set<AudioDevice>>? _devicesSub;
-  Set<AudioDevice>? _previousDevices;
+  StreamSubscription<AudioRouteChange>? _routeChangeSub;
   final Stopwatch _positionClock = Stopwatch();
   // 平滑位置的上一次取值：用于过滤位置流的小幅倒退（音频缓冲/时钟抖动），
   // 避免歌词高亮和卡拉OK进度出现回跳。seek/换歌的大跨度回退会重建基线。
@@ -485,14 +501,17 @@ class PlayerController extends ChangeNotifier {
   DesktopLyricsSettings desktopLyricsSettings = const DesktopLyricsSettings();
   Timer? _autoResumeTimer;
 
-  /// 进入打断/断连事件时播放器是否正在播放。
+  /// 播放安全闸门：焦点阶段/暂停原因/路由快照的唯一载体（I5）。
   ///
-  /// 用于打断结束后只恢复「打断前本来就在播」的场景，避免把用户主动暂停
-  /// 误判成被打断、从而在电话等操作结束后自动恢复播放。
-  bool _wasPlayingAtInterruption = false;
-  bool _isAudioInterrupted = false;
-  bool _interruptionRequiresPause = false;
-  bool _resumeBlockedByDisconnect = false;
+  /// 替代原先散落的四个布尔（_wasPlayingAtInterruption/_isAudioInterrupted/
+  /// _interruptionRequiresPause/_resumeBlockedByDisconnect），
+  /// 「能不能出声」只经 [_guard.decide] 判断。
+  final PlaybackGuard _guard = PlaybackGuard();
+
+  /// 双源路由监听（C2 先挂载提供快照；ready/abandoned 消费在 C3 接入）。
+  late final AudioRouteMonitor _routeMonitor = AudioRouteMonitor(
+    sessionProvider: _audioSessionProvider,
+  );
   int _autoResumeSerial = 0;
   int _playbackIntentSerial = 0;
   int? _pendingPlaybackIntent;
@@ -685,7 +704,10 @@ class PlayerController extends ChangeNotifier {
     bool preservePersonalFmSession = false,
     QueueOrigin? origin,
     bool userInitiated = true,
+    PlayOrigin? playOrigin,
   }) async {
+    final effectiveOrigin = playOrigin ??
+        (userInitiated ? PlayOrigin.userTap : PlayOrigin.automatic);
     if (userInitiated) _handleManualPlay();
     final intentSerial = _playbackIntentSerial;
     final requestSerial = _beginSourceChange(playbackIntent: intentSerial);
@@ -832,6 +854,7 @@ class PlayerController extends ChangeNotifier {
         await _startPlayback(
           expectedIntent: intentSerial,
           expectedRequest: requestSerial,
+          origin: effectiveOrigin,
         );
         if (requestSerial != _playRequestSerial) return;
         unawaited(_applyVolumeNormalization());
@@ -855,7 +878,7 @@ class PlayerController extends ChangeNotifier {
       if (requestSerial != _playRequestSerial) return;
       debugPrint('[KA Music][playback] request=$requestSerial failed: $error');
       errorMessage = error.toString();
-      unawaited(_audioHandler.pause());
+      unawaited(_enginePause());
       notifyListeners();
     } finally {
       _finishSourceChange(requestSerial);
@@ -897,22 +920,34 @@ class PlayerController extends ChangeNotifier {
   Future<void> _startPlayback({
     required int expectedIntent,
     int? expectedRequest,
-    bool allowDuringInterruption = false,
+    PlayOrigin origin = PlayOrigin.automatic,
   }) async {
     await _audioSessionReady;
     // A disconnect may arrive while a song URL or source is still loading.
     // Only a later explicit play request may release this block.
     if ((expectedRequest != null && expectedRequest != _playRequestSerial) ||
-        expectedIntent != _playbackIntentSerial ||
-        _resumeBlockedByDisconnect ||
-        (_interruptionRequiresPause &&
-            audioInterruptionEnabled &&
-            !allowDuringInterruption)) {
+        expectedIntent != _playbackIntentSerial) {
       return;
     }
-    // User intent is recorded at the public entry point, before any network or
-    // source loading. Completing that work must never grant fresh permission.
-    await _audioHandler.play(userInitiated: false);
+    // 唯一播放闸门（I5）：三路状态（焦点/暂停原因/路由）在这里汇成
+    // 一次决策。defer 时静默等待路由/焦点事件再次触发；deny 时丢弃
+    // 并写日志供定位（不再出现「点了没反应」的无声卡死——B1）。
+    final decision = _guard.decide(origin, _currentRouteSnapshot());
+    if (decision != PlayDecision.allow) {
+      debugPrint(
+        '[KA Music][gate] ${origin.name} -> ${decision.name} '
+        'route=${_currentRouteSnapshot().short} guard=$_guard',
+      );
+      return;
+    }
+    // 不再播放器自己起播：统一走 handler 的闸门出口（内部路径，
+    // 用户意图已在公开入口处理，不重复触发 transport 回调）。
+    await _audioHandler.playInternal(origin);
+    // 起播成功：清除断连标记（B6），当前路由已被闸门确认安全。
+    if (origin != PlayOrigin.automatic ||
+        _guard.lastPause != PauseCause.disconnect) {
+      _persistDisconnectPause(false);
+    }
     // 每次（重新）起播都刷新一次当前歌词元数据。车机重新连接、
     // 应用重启恢复播放时，旧的 MediaSession/广播状态可能已失效。
     _announceBluetoothLyrics();
@@ -1487,21 +1522,24 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  Future<void> togglePlay() async {
+  Future<void> togglePlay({PlayOrigin origin = PlayOrigin.userTap}) async {
     _cancelAutomaticResume();
     if (audioPlayer.playing) {
-      await _audioHandler.pause();
+      await _enginePause();
       // 暂停瞬间落盘一次进度：用户经常暂停后直接退出，5 秒定时器
       // 可能还没触发，位置会停留在上一次保存点。
       _saveCurrentPosition();
     } else {
-      _handleManualPlay();
+      if (origin == PlayOrigin.userTap) _handleManualPlay();
       final intentSerial = _playbackIntentSerial;
       if (audioPlayer.processingState == ProcessingState.completed) {
         await _audioHandler.seek(Duration.zero);
         _completedPlayRequest = null;
       }
-      await _startPlayback(expectedIntent: intentSerial);
+      await _startPlayback(
+        expectedIntent: intentSerial,
+        origin: origin,
+      );
     }
   }
 
@@ -1543,6 +1581,7 @@ class PlayerController extends ChangeNotifier {
     final end = _climaxEndTime;
     if (end == null || value < end) return;
     _climaxEndTime = null;
+    _guard.recordPause(PauseCause.completion, _currentRouteSnapshot());
     unawaited(pause());
   }
 
@@ -1570,14 +1609,17 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  Future<void> play() async {
+  Future<void> play({PlayOrigin origin = PlayOrigin.userTap}) async {
     if (!audioPlayer.playing) {
-      await togglePlay();
+      await togglePlay(origin: origin);
     }
   }
 
   Future<void> pause() async {
     _cancelAutomaticResume();
+    // 无条件记录用户暂停（即使引擎已停）：阻断此后一切自动恢复，
+    // 包括通话结束后按打断前的在播状态误恢复。
+    _guard.recordPause(PauseCause.user, _currentRouteSnapshot());
     if (audioPlayer.playing) {
       await togglePlay();
     }
@@ -1617,6 +1659,7 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
+  /// 用户切换下一首（界面按钮/通知栏/耳机键）。
   Future<void> next() async {
     _handleManualPlay();
     if (_isPersonalFmActive && _isAtQueueEnd) {
@@ -1630,6 +1673,7 @@ class PlayerController extends ChangeNotifier {
       queue: queue,
       preservePersonalFmSession: _isPersonalFmActive,
       userInitiated: false,
+      playOrigin: PlayOrigin.userTap,
     );
   }
 
@@ -1642,6 +1686,7 @@ class PlayerController extends ChangeNotifier {
         queue: queue,
         preservePersonalFmSession: _isPersonalFmActive,
         userInitiated: false,
+        playOrigin: PlayOrigin.userTap,
       );
     } else {
       await seek(Duration.zero);
@@ -1659,8 +1704,9 @@ class PlayerController extends ChangeNotifier {
       _handlingCompletionRequest != _playRequestSerial &&
       _completedPlayRequest != _playRequestSerial &&
       audioPlayer.playing &&
-      !_resumeBlockedByDisconnect &&
-      !(_interruptionRequiresPause && audioInterruptionEnabled) &&
+      // 自动切歌也要过闸门：断连/焦点占用期间不自动播下一首。
+      _guard.decide(PlayOrigin.automatic, _currentRouteSnapshot()) ==
+          PlayDecision.allow &&
       currentSong != null &&
       identical(_audioHandler.loadedSong, currentSong);
 
@@ -1679,7 +1725,7 @@ class PlayerController extends ChangeNotifier {
         _sleepFinishCurrentSongOption = false;
         sleepTimerRemaining = null;
         notifyListeners();
-        unawaited(_audioHandler.pause());
+        unawaited(_enginePause());
         return;
       }
 
@@ -1871,40 +1917,56 @@ class PlayerController extends ChangeNotifier {
     try {
       final session = await _audioSessionProvider();
       await session.configure(_audioSessionConfiguration);
+      // 路由快照源：桌面等不支持的平台保持 unknown（闸门不做路由拦截）。
+      unawaited(_routeMonitor.start());
       _interruptionSub = session.interruptionEventStream.listen((event) {
         if (event.begin) {
           _autoResumeTimer?.cancel();
           _autoResumeSerial++;
-          if (!_isAudioInterrupted) {
-            _wasPlayingAtInterruption =
-                audioPlayer.playing ||
-                _pendingPlaybackIntent == _playbackIntentSerial;
-          }
-          _isAudioInterrupted = true;
+          final wasPlaying =
+              audioPlayer.playing ||
+              _pendingPlaybackIntent == _playbackIntentSerial;
+          final route = _currentRouteSnapshot();
           // just_audio 的自动打断已关闭，duck 的音量恢复也由这里接管。
           if (event.type == AudioInterruptionType.duck) {
-            if (audioInterruptionEnabled && !_isDucking) {
-              _isDucking = true;
-              unawaited(_updateAttenuatedVolume());
+            if (audioInterruptionEnabled) {
+              if (!_isDucking) {
+                _isDucking = true;
+                unawaited(_updateAttenuatedVolume());
+              }
+              _guard.recordInterruptionBegin(
+                InterruptionPhase.ducked,
+                wasPlaying: wasPlaying,
+                currentRoute: route,
+              );
             }
             return;
           }
           // 音频焦点丢失可能没有单独的 duck 结束事件。
           _restoreDuckedVolume();
-          _interruptionRequiresPause = true;
           if (audioInterruptionEnabled) {
-            unawaited(_audioHandler.pause(userInitiated: false));
-          } else if (_wasPlayingAtInterruption) {
-            _scheduleAutomaticResume(
-              const Duration(milliseconds: 300),
-              allowDuringInterruption: true,
+            // pause 对应瞬时焦点丢失（来电等）；unknown 对应永久丢失。
+            // 永久丢失没有 end 事件，直到重新申请焦点成功——这正是
+            // 「点了播放没反应」死锁（B1）的来源，由 guard 的
+            // userTap 永远放行 + recordUserPlay 清除焦点阶段来修复。
+            _guard.recordInterruptionBegin(
+              event.type == AudioInterruptionType.pause
+                  ? InterruptionPhase.transient
+                  : InterruptionPhase.permanent,
+              wasPlaying: wasPlaying,
+              currentRoute: route,
             );
+            unawaited(_enginePause(userInitiated: false));
+          } else if (wasPlaying) {
+            // 阻止打断模式：不暂停、不标记焦点阶段；闸门在焦点 none 下
+            // 放行，这里只负责把可能被系统层掐断的播放拉回来。
+            _scheduleAutomaticResume(const Duration(milliseconds: 300));
           }
         } else {
-          final shouldResume = _wasPlayingAtInterruption;
-          _wasPlayingAtInterruption = false;
-          _isAudioInterrupted = false;
-          _interruptionRequiresPause = false;
+          final wasPlayingAtBegin = _guard.resumeAfterInterruption;
+          _guard.recordInterruptionEnd(
+            permanentLossResolved: event.type == AudioInterruptionType.unknown,
+          );
           _restoreDuckedVolume();
           if (event.type != AudioInterruptionType.duck &&
               audioInterruptionEnabled &&
@@ -1915,7 +1977,7 @@ class PlayerController extends ChangeNotifier {
             _cancelAutomaticResume();
           }
           if (event.type == AudioInterruptionType.pause &&
-              shouldResume &&
+              wasPlayingAtBegin &&
               (autoResumeAfterInterruption || (!audioInterruptionEnabled)) &&
               currentSong != null) {
             _scheduleAutomaticResume(const Duration(milliseconds: 500));
@@ -1923,66 +1985,143 @@ class PlayerController extends ChangeNotifier {
         }
       });
       _becomingNoisySub = session.becomingNoisyEventStream.listen((_) {
-        if (autoPauseOnDeviceDisconnect) {
-          _resumeBlockedByDisconnect = true;
-          _cancelAutomaticResume();
-          _restoreDuckedVolume();
-          // 即使来电已经暂停，也要撤销正在启动的播放请求。
-          unawaited(_audioHandler.pause(userInitiated: false));
-          return;
-        }
-        if (!audioInterruptionEnabled) {
-          // 阻止打断模式下忽略耳机拔出
-          return;
-        }
-        final wasPlaying = audioPlayer.playing;
-        unawaited(_audioHandler.pause(userInitiated: false));
-        if (wasPlaying && autoResumeAfterInterruption && currentSong != null) {
-          _scheduleAutomaticResume(const Duration(milliseconds: 500));
-        }
+        _handleRouteAbandoned('becomingNoisy');
       });
-      _previousDevices = await session.getDevices();
-      _devicesSub = session.devicesStream.listen((devices) {
-        if (_previousDevices != null) {
-          final addedDevices = devices.difference(_previousDevices!);
-          if (addedDevices.isNotEmpty) {
-            // ignore: experimental_member_use
-            final hasNewAudioDevice = addedDevices.any(
-              (d) =>
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.bluetoothA2dp ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.bluetoothLe ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.bluetoothSco ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.wiredHeadset ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.wiredHeadphones ||
-                  // ignore: experimental_member_use
-                  d.type == AudioDeviceType.carAudio,
-            );
+      // 设备层由 AudioRouteMonitor 接管：becomingNoisy 快通道之外
+      // 新增设备移除兜底（B2），新增输出设备防抖确认为 ready（B5）。
+      // 原有 devicesStream 全量差集 + 不查 isOutput/含 SCO 的旧实现废弃。
+      _routeChangeSub = _routeMonitor.changes.listen(_handleRouteChange);
+    } catch (error) {
+      // AudioSession 不可用（桌面平台等）：记录日志并保持 guard 的
+      // unknown 路由策略，不再静默丢弃（B8）。
+      debugPrint('[KA Music][audio] setup listeners failed: $error');
+    }
+  }
 
-            if (hasNewAudioDevice &&
-                autoPlayOnDeviceConnected &&
-                currentSong != null &&
-                !audioPlayer.playing &&
-                !_isAudioInterrupted) {
-              _resumeBlockedByDisconnect = false;
-              _scheduleAutomaticResume(const Duration(milliseconds: 500));
-            }
-            if (hasNewAudioDevice) {
-              // 车机刚建立连接时接收端可能尚未注册完成：先主动刷新一次，
-              // 再延迟补发一次，避免第二次连接后一直收不到歌词（#161）。
-              _announceBluetoothLyrics();
-              _scheduleBluetoothLyricsAnnouncement();
-            }
-          }
-        }
-        _previousDevices = devices;
-      });
-    } catch (_) {
-      // AudioSession not available on this platform
+  /// 路由事件分发（AudioRouteMonitor 的唯一消费入口）。
+  void _handleRouteChange(AudioRouteChange change) {
+    switch (change.reason) {
+      case AudioRouteChangeReason.abandoned:
+        // becomingNoisy 缺席时的兜底通道（B2）：与快通道同一处理，幂等。
+        _handleRouteAbandoned(change.context ?? 'device-removed');
+      case AudioRouteChangeReason.ready:
+        _handleRouteReady(change);
+      case AudioRouteChangeReason.snapshot:
+        // 快照刷新不需要动作：decide 在每次播放时实时读取当前路由。
+        break;
+    }
+  }
+
+  /// 外部媒体输出丢失（拔耳机/蓝牙断开）：暂停并记录断连挂起。
+  ///
+  /// becomingNoisy 快通道与设备移除兜底通道共用；重复触发幂等。
+  void _handleRouteAbandoned(String source) {
+    debugPrint('[KA Music][gate] route abandoned ($source)');
+    final route = _currentRouteSnapshot();
+    if (autoPauseOnDeviceDisconnect) {
+      // 断开即暂停（默认开启）：立即停下并记录「因断连暂停」。
+      // 该挂起只在路由回连（ready）时解除——绝不从扬声器自动续播
+      // （I1/B2/B4/B6）。
+      _cancelAutomaticResume();
+      // 先暂停再恢复 duck 音量，避免拔耳机瞬间满音量爆音（B8）。
+      unawaited(_enginePause(userInitiated: false));
+      _restoreDuckedVolume();
+      _guard.recordPause(PauseCause.disconnect, route);
+      // B6：跨进程持久化，重启后的自启动流程不得在扬声器上恢复。
+      _persistDisconnectPause(true);
+      return;
+    }
+    // B7 修复：断连后的行为不再与「阻止打断」开关耦合。
+    // 原实现里「阻止打断 + 关闭断开暂停」会完全忽略拔耳机，
+    // 音乐从扬声器继续放；现在无论焦点策略如何都走暂停，
+    // 仅在开启 autoResumeAfterInterruption 时按兼容旧行为恢复。
+    final wasPlaying =
+        audioPlayer.playing ||
+        _pendingPlaybackIntent == _playbackIntentSerial;
+    unawaited(_enginePause(userInitiated: false));
+    if (wasPlaying) {
+      // 兼容旧行为：按打断语义记录，随后可恢复（含在扬声器上恢复，
+      // 这是用户显式关闭「断开停止播放」后选择的行为）。
+      _guard.recordPause(PauseCause.interruption, route);
+      if (autoResumeAfterInterruption && currentSong != null) {
+        _scheduleAutomaticResume(const Duration(milliseconds: 500));
+      }
+    }
+  }
+
+  /// 外部输出确认可用（重连/插入，经防抖确认）。
+  ///
+  /// 三件事（B4/B5）：
+  /// 1. 解除断连挂起：断连暂停后的自动续播在此恢复资格；
+  ///    deferred 的恢复（通话结束但 A2DP 未回等）也由这里唤醒重试；
+  /// 2. 连接新设备自动播放：ready 已含 isOutput + 非 SCO-only 确认，
+  ///    修复旧实现「设备出现≠路由生效/SCO 输入也触发」的缺陷；
+  /// 3. 车机歌词公告：设备就绪后主动刷新（#161）。
+  void _handleRouteReady(AudioRouteChange change) {
+    debugPrint('[KA Music][gate] route ready -> ${change.snapshot.short}');
+    final disconnectResolved = _guard.recordRouteReady(change.snapshot);
+    debugPrint('[KA Music][gate] routeReady resolved=$disconnectResolved');
+
+    // 断连暂停后的自动续播（含 B4 的 deferred 唤醒）。
+    if (disconnectResolved &&
+        autoResumeAfterInterruption &&
+        currentSong != null &&
+        !audioPlayer.playing) {
+      _scheduleAutomaticResume(const Duration(milliseconds: 300));
+    }
+
+    // 连接新设备自动播放（用户显式开启才生效）。
+    if (autoPlayOnDeviceConnected &&
+        currentSong != null &&
+        !audioPlayer.playing &&
+        _guard.focus == InterruptionPhase.none) {
+      _scheduleAutomaticResume(const Duration(milliseconds: 300));
+    }
+
+    // 车机刚建立连接时接收端可能尚未注册完成：先主动刷新一次，
+    // 再延迟补发一次，避免第二次连接后一直收不到歌词（#161）。
+    _announceBluetoothLyrics();
+    _scheduleBluetoothLyricsAnnouncement();
+  }
+
+  /// 统一的引擎暂停出口：打上「本应用主动暂停」时间戳，
+  /// 供 [_detectUnexpectedEnginePause] 区分系统被动暂停。
+  Future<void> _enginePause({bool userInitiated = true}) async {
+    _lastSelfPauseAt = DateTime.now();
+    await _audioHandler.pause(userInitiated: userInitiated);
+  }
+
+  /// 最近一次由本应用主动发起的暂停时间。
+  DateTime? _lastSelfPauseAt;
+
+  /// 引擎在无本应用暂停请求的情况下停止（真机实测 MIUI 拔蓝牙不发
+  /// becomingNoisy、设备事件也可能缺席，AudioTrack 被系统直接停掉）。
+  ///
+  /// 处理：主动向系统做一次权威路由查询（getDevices），若已无外部
+  /// 媒体输出，则按「断连暂停」归因——阻断后续一切自动/系统来源的
+  /// 扬声器外放（B2/B3 的最后一道兜底）。
+  Future<void> _detectUnexpectedEnginePause() async {
+    // 已有明确归因（用户暂停/断连/打断记录在先）时不覆盖。
+    if (_guard.lastPause != null) return;
+    // 我们自己刚发起的暂停（含其状态回调延迟到达）。
+    final selfPauseAt = _lastSelfPauseAt;
+    if (selfPauseAt != null &&
+        DateTime.now().difference(selfPauseAt) < const Duration(seconds: 3)) {
+      return;
+    }
+    debugPrint('[KA Music][gate] unexpected engine pause; probing route');
+    final snapshot = await _routeMonitor.refresh();
+    if (snapshot.known && !snapshot.hasExternalOutput) {
+      debugPrint(
+        '[KA Music][gate] route lost external output -> disconnect hold',
+      );
+      _cancelAutomaticResume();
+      _guard.recordPause(PauseCause.disconnect, snapshot);
+      _persistDisconnectPause(true);
+    } else {
+      debugPrint(
+        '[KA Music][gate] unexpected pause, route=${snapshot.short} (no action)',
+      );
     }
   }
 
@@ -1991,13 +2130,45 @@ class PlayerController extends ChangeNotifier {
     _autoResumeTimer = null;
     _autoResumeSerial++;
     _playbackIntentSerial++;
-    _wasPlayingAtInterruption = false;
   }
 
+  /// 通知栏/锁屏/耳机键的暂停（经 handler 转发）：等同用户暂停，
+  /// 阻断此后所有自动恢复。
+  void _handleExternalPause() {
+    _cancelAutomaticResume();
+    _guard.recordPause(PauseCause.user, _currentRouteSnapshot());
+  }
+
+  /// 用户显式播放入口的安全清理（I3/I4）。
   void _handleManualPlay() {
     _cancelAutomaticResume();
-    _resumeBlockedByDisconnect = false;
+    // 清除断连/用户暂停挂起；焦点阶段若被永久抢占，由随后
+    // handler.play 内的 setActive(true) 重新申请并恢复。
+    _guard.recordUserPlay();
     _restoreDuckedVolume();
+    _persistDisconnectPause(false);
+  }
+
+  /// 持久化/清除「因断连暂停」标记（B6）。
+  void _persistDisconnectPause(bool paused) {
+    SharedPreferences.getInstance()
+        .then((prefs) => prefs.setBool(_disconnectPauseKey, paused))
+        .catchError((_) {});
+  }
+
+  /// 上次运行是否因耳机/蓝牙断开而暂停（用于启动时禁止自动播放）。
+  static Future<bool> isPausedByDisconnect() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_disconnectPauseKey) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 当前路由快照（C3 接入 AudioRouteMonitor 后返回实时值）。
+  AudioRouteSnapshot _currentRouteSnapshot() {
+    return _routeMonitor.current;
   }
 
   void _restoreDuckedVolume() {
@@ -2037,7 +2208,7 @@ class PlayerController extends ChangeNotifier {
 
   void _scheduleAutomaticResume(
     Duration delay, {
-    bool allowDuringInterruption = false,
+    PlayOrigin origin = PlayOrigin.automatic,
   }) {
     _autoResumeTimer?.cancel();
     final serial = ++_autoResumeSerial;
@@ -2045,8 +2216,6 @@ class PlayerController extends ChangeNotifier {
     _autoResumeTimer = Timer(delay, () async {
       await _audioSessionReady;
       if (serial != _autoResumeSerial ||
-          _resumeBlockedByDisconnect ||
-          (_isAudioInterrupted && !allowDuringInterruption) ||
           audioPlayer.playing ||
           isPreparing ||
           _isChangingSource ||
@@ -2055,7 +2224,7 @@ class PlayerController extends ChangeNotifier {
       }
       await _startPlayback(
         expectedIntent: intentSerial,
-        allowDuringInterruption: allowDuringInterruption,
+        origin: origin,
       );
     });
   }
@@ -2568,7 +2737,9 @@ class PlayerController extends ChangeNotifier {
     _sleepFinishCurrentSongOption = false;
     sleepTimerRemaining = null;
     notifyListeners();
-    unawaited(_audioHandler.pause());
+    // 睡眠定时到点：按完成语义记录，阻断其后一切自动恢复。
+    _guard.recordPause(PauseCause.completion, _currentRouteSnapshot());
+    unawaited(_enginePause());
   }
 
   Future<void> _restoreSettings() async {
@@ -3080,7 +3251,8 @@ class PlayerController extends ChangeNotifier {
     _androidAudioSessionSub.cancel();
     _interruptionSub?.cancel();
     _becomingNoisySub?.cancel();
-    _devicesSub?.cancel();
+    _routeChangeSub?.cancel();
+    _routeMonitor.dispose();
     _completionFallbackTimer?.cancel();
     unawaited(
       _audioEffects.configureEqualizer(
@@ -3435,7 +3607,9 @@ class PlayerController extends ChangeNotifier {
 
   /// 在恢复队列后加载并准备播放当前歌曲（默认不自动播放，仅预加载）。
   ///
-  /// [autoPlay] 为 true 时（“恢复上次播放列表”开机模式）加载完成后立即播放。
+  /// [autoPlay] 为 true 时（“恢复上次播放列表”开机模式）加载完成后立即播放；
+  /// 但若上次运行因耳机/蓝牙断开而暂停（B6 持久化标记），降级为仅预加载，
+  /// 不得在扬声器上自动恢复。
   Future<void> prepareRestoredSong({
     bool autoPlay = false,
     Song? expectedSong,
@@ -3444,6 +3618,10 @@ class PlayerController extends ChangeNotifier {
     if (song == null ||
         (expectedSong != null && !identical(currentSong, expectedSong))) {
       return;
+    }
+    // B6：断连暂停标记跨重启生效。
+    if (autoPlay && await isPausedByDisconnect()) {
+      autoPlay = false;
     }
     final intentSerial = _playbackIntentSerial;
     final requestSerial = _beginSourceChange(

@@ -79,7 +79,8 @@ class AudioInterruptionSettingsPage extends StatelessWidget {
                         ),
                         title: const Text('阻止后台打断'),
                         subtitle: const Text(
-                          '其他 App 播放音频时不会暂停当前音乐',
+                          '其他 App 播放音频时不会暂停当前音乐'
+                          '（不影响耳机断开保护）',
                         ),
                         contentPadding: const EdgeInsets.symmetric(
                           horizontal: 14,
@@ -115,9 +116,10 @@ class AudioInterruptionSettingsPage extends StatelessWidget {
                           Icons.headset_off_rounded,
                           color: colorScheme.primary,
                         ),
-                        title: const Text('蓝牙断开停止播放'),
+                        title: const Text('耳机断开停止播放'),
                         subtitle: const Text(
-                          '耳机/蓝牙断开时立即暂停，避免意外外放',
+                          '拔出耳机/断开蓝牙立即暂停，重连确认后自动继续；'
+                          '该保护不受「阻止后台打断」影响，仅在移动端生效',
                         ),
                         contentPadding: const EdgeInsets.symmetric(
                           horizontal: 14,
