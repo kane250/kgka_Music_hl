@@ -1111,5 +1111,71 @@ void main() {
       expect(routeHandler.audioPlayer.playing, isTrue);
       expect(routeHandler.automaticPlays, 1);
     });
+
+    test('断连挂起时深链播放被闸门拒绝，用户显式播放放行（B3）',
+        () async {
+      await Future<void>.delayed(Duration.zero);
+      routeSession.addBluetoothMediaDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      routeHandler.audioPlayer.setPlaying(true);
+      routeSession.noisy.add(null);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 深链 toggle：externalLink 来源 + 断连挂起 + 路由落回扬声器 → defer。
+      await routePlayer.togglePlay(origin: PlayOrigin.externalLink);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 用户在 App 内显式播放：userTap 解锁放行。
+      await routePlayer.play();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(routeHandler.audioPlayer.playing, isTrue);
+    });
+
+    test('断连暂停跨重启：恢复自启动不自动播放（B6）', () async {
+      await Future<void>.delayed(Duration.zero);
+      routeSession.addBluetoothMediaDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      routeHandler.audioPlayer.setPlaying(true);
+      routeSession.noisy.add(null);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 断连标记已持久化。
+      final prefs = await SharedPreferences.getInstance();
+      expect(
+        prefs.getBool('playback.paused_by_disconnect'),
+        isTrue,
+        reason: '断连暂停必须落盘，重启后才能禁止自启动外放',
+      );
+
+      // 模拟重启：新建 player（同一 prefs），上次歌曲恢复自启动流程。
+      final rebootHandler = _Handler();
+      final rebootSession = _Session();
+      routePlayer.dispose();
+      routePlayer = PlayerController(
+        api,
+        rebootHandler,
+        audioSessionProvider: () async => rebootSession,
+      );
+      routePlayer.currentSong = const Song(
+        id: '1',
+        title: 'Route',
+        artist: 'Artist',
+        hash: 'ROUTE',
+        source: SongSource.netease,
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      // 恢复上次播放列表（autoPlay）：读到断连标记 → 降级为仅预加载。
+      await routePlayer.prepareRestoredSong(autoPlay: true);
+      expect(rebootHandler.audioPlayer.playing, isFalse);
+      expect(rebootHandler.automaticPlays, 0);
+
+      // 用户显式播放清除断连标记并正常起播。
+      await routePlayer.play();
+      expect(rebootHandler.audioPlayer.playing, isTrue);
+    });
   });
 }

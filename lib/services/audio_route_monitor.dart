@@ -199,11 +199,14 @@ class AudioRouteMonitor {
   }
 
   /// becomingNoisy：权威的「外部输出丢失」信号，立即广播。
-  Future<void> _handleBecomingNoisy() async {
+  ///
+  /// 不做 getDevices 刷新：真机上广播可能先于设备列表更新（竞态），
+  /// 刷新会把「已丢失」错误地改回「存在」。合成快照保持到下一次
+  /// 设备事件（added 确认/removed 剔除）驱动。
+  void _handleBecomingNoisy() {
     if (_disposed) return;
     _additionConfirm?.cancel();
     _emitAbandoned('becomingNoisy');
-    await _refreshSnapshot(reason: AudioRouteChangeReason.snapshot);
   }
 
   void _handleDevicesChanged(AudioDevicesChangedEvent event) {
@@ -213,16 +216,14 @@ class AudioRouteMonitor {
 
     if (removedExternal) {
       // 兜底通道：becomingNoisy 缺席时靠它暂停。
-      // 短防抖合并同一断开动作产生的多条事件。
+      // 以设备事件为权威剔除被移除的外部输出（getDevices 与事件竞态时
+      // 不可靠）；短防抖合并同一断开动作产生的多条事件。
       _additionConfirm?.cancel();
       _removalDebounce?.cancel();
       _removalDebounce = Timer(const Duration(milliseconds: 60), () {
         if (_disposed) return;
-        _emitAbandoned(
-          'removed:${event.devicesRemoved.map((d) => d.id).join(',')}',
-        );
-        unawaited(
-          _refreshSnapshot(reason: AudioRouteChangeReason.snapshot),
+        _applyRemoval(
+          event.devicesRemoved.where(isMediaOutput).map((d) => d.id).toSet(),
         );
       });
       return;
@@ -237,6 +238,29 @@ class AudioRouteMonitor {
         unawaited(_confirmAddition());
       });
     }
+  }
+
+  /// 从当前快照中剔除被移除的外部设备。
+  ///
+  /// 若仍有其他外部输出（双耳机/双蓝牙切换）：只刷新快照不发
+  /// abandoned（避免多设备切换误暂停）；若全部移除：广播 abandoned。
+  void _applyRemoval(Set<String> removedIds) {
+    final remaining = _current.externalDeviceIds.difference(removedIds);
+    final snapshot = AudioRouteSnapshot(
+      known: true,
+      hasExternalOutput: remaining.isNotEmpty,
+      hasCallOnlyBluetooth:
+          remaining.isNotEmpty ? false : _current.hasCallOnlyBluetooth,
+      externalDeviceIds: remaining,
+    );
+    _current = snapshot;
+    _changesController.add(AudioRouteChange(
+      snapshot: snapshot,
+      reason: remaining.isEmpty
+          ? AudioRouteChangeReason.abandoned
+          : AudioRouteChangeReason.snapshot,
+      context: 'removed:${removedIds.join(',')}',
+    ));
   }
 
   Future<void> _confirmAddition() async {

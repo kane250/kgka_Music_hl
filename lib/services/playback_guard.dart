@@ -176,9 +176,19 @@ class PlaybackGuard extends ChangeNotifier {
     // 已有用户暂停，绝不允许后续系统事件改写为可自动恢复的原因。
     if (_lastPause == PauseCause.user) return;
     if (cause == PauseCause.disconnect) {
+      final previousPause = _lastPause;
       _resumeAfterInterruption = false;
       _lastPause = cause;
-      _routeAtPause = currentRoute;
+      // 通话中耳机断开：保留打断开始时的路由快照（耳机上），
+      // 它是「通话结束+耳机回连后恢复」的判断依据（B4），
+      // 不能被断连时刻的（已失去外部输出的）快照覆盖。
+      final preserveInterruptionRoute =
+          previousPause == PauseCause.interruption &&
+          _routeAtPause?.known == true &&
+          _routeAtPause!.hasExternalOutput;
+      if (!preserveInterruptionRoute) {
+        _routeAtPause = currentRoute;
+      }
       notifyListeners();
       return;
     }

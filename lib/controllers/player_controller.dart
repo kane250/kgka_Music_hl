@@ -212,6 +212,9 @@ class PlayerController extends ChangeNotifier {
   /// 就会出现「当前歌曲已保存、队列没保存」的残缺状态：重启后只剩一首歌，
   /// 点「下一首」永远原地不动，必须重新进歌单点播才能恢复。
   static const _stateKey = 'playback.state_snapshot';
+  /// 断连暂停持久化（B6）：进程被杀/重启后自启动流程读到它
+  /// 就不自动播放，保证「拔耳机→暂停」的保护跨重启仍然 fail-closed。
+  static const _disconnectPauseKey = 'playback.paused_by_disconnect';
   static const _queueSaveDebounceMs = 500;
   static const _positionSaveInterval = Duration(seconds: 5);
   static const _listenTimeReportInterval = Duration(minutes: 5);
@@ -932,6 +935,11 @@ class PlayerController extends ChangeNotifier {
     // 不再播放器自己起播：统一走 handler 的闸门出口（内部路径，
     // 用户意图已在公开入口处理，不重复触发 transport 回调）。
     await _audioHandler.playInternal(origin);
+    // 起播成功：清除断连标记（B6），当前路由已被闸门确认安全。
+    if (origin != PlayOrigin.automatic ||
+        _guard.lastPause != PauseCause.disconnect) {
+      _persistDisconnectPause(false);
+    }
     // 每次（重新）起播都刷新一次当前歌词元数据。车机重新连接、
     // 应用重启恢复播放时，旧的 MediaSession/广播状态可能已失效。
     _announceBluetoothLyrics();
@@ -1506,7 +1514,7 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  Future<void> togglePlay() async {
+  Future<void> togglePlay({PlayOrigin origin = PlayOrigin.userTap}) async {
     _cancelAutomaticResume();
     if (audioPlayer.playing) {
       await _audioHandler.pause();
@@ -1514,7 +1522,7 @@ class PlayerController extends ChangeNotifier {
       // 可能还没触发，位置会停留在上一次保存点。
       _saveCurrentPosition();
     } else {
-      _handleManualPlay();
+      if (origin == PlayOrigin.userTap) _handleManualPlay();
       final intentSerial = _playbackIntentSerial;
       if (audioPlayer.processingState == ProcessingState.completed) {
         await _audioHandler.seek(Duration.zero);
@@ -1522,7 +1530,7 @@ class PlayerController extends ChangeNotifier {
       }
       await _startPlayback(
         expectedIntent: intentSerial,
-        origin: PlayOrigin.userTap,
+        origin: origin,
       );
     }
   }
@@ -1593,9 +1601,9 @@ class PlayerController extends ChangeNotifier {
     }
   }
 
-  Future<void> play() async {
+  Future<void> play({PlayOrigin origin = PlayOrigin.userTap}) async {
     if (!audioPlayer.playing) {
-      await togglePlay();
+      await togglePlay(origin: origin);
     }
   }
 
@@ -2010,6 +2018,8 @@ class PlayerController extends ChangeNotifier {
       unawaited(_audioHandler.pause(userInitiated: false));
       _restoreDuckedVolume();
       _guard.recordPause(PauseCause.disconnect, route);
+      // B6：跨进程持久化，重启后的自启动流程不得在扬声器上恢复。
+      _persistDisconnectPause(true);
       return;
     }
     // B7 修复：断连后的行为不再与「阻止打断」开关耦合。
@@ -2084,6 +2094,24 @@ class PlayerController extends ChangeNotifier {
     // handler.play 内的 setActive(true) 重新申请并恢复。
     _guard.recordUserPlay();
     _restoreDuckedVolume();
+    _persistDisconnectPause(false);
+  }
+
+  /// 持久化/清除「因断连暂停」标记（B6）。
+  void _persistDisconnectPause(bool paused) {
+    SharedPreferences.getInstance()
+        .then((prefs) => prefs.setBool(_disconnectPauseKey, paused))
+        .catchError((_) {});
+  }
+
+  /// 上次运行是否因耳机/蓝牙断开而暂停（用于启动时禁止自动播放）。
+  static Future<bool> isPausedByDisconnect() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getBool(_disconnectPauseKey) ?? false;
+    } catch (_) {
+      return false;
+    }
   }
 
   /// 当前路由快照（C3 接入 AudioRouteMonitor 后返回实时值）。
@@ -3527,7 +3555,9 @@ class PlayerController extends ChangeNotifier {
 
   /// 在恢复队列后加载并准备播放当前歌曲（默认不自动播放，仅预加载）。
   ///
-  /// [autoPlay] 为 true 时（“恢复上次播放列表”开机模式）加载完成后立即播放。
+  /// [autoPlay] 为 true 时（“恢复上次播放列表”开机模式）加载完成后立即播放；
+  /// 但若上次运行因耳机/蓝牙断开而暂停（B6 持久化标记），降级为仅预加载，
+  /// 不得在扬声器上自动恢复。
   Future<void> prepareRestoredSong({
     bool autoPlay = false,
     Song? expectedSong,
@@ -3536,6 +3566,10 @@ class PlayerController extends ChangeNotifier {
     if (song == null ||
         (expectedSong != null && !identical(currentSong, expectedSong))) {
       return;
+    }
+    // B6：断连暂停标记跨重启生效。
+    if (autoPlay && await isPausedByDisconnect()) {
+      autoPlay = false;
     }
     final intentSerial = _playbackIntentSerial;
     final requestSerial = _beginSourceChange(

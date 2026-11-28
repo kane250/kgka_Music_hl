@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../controllers/player_controller.dart';
 import '../services/music_api.dart';
+import '../services/playback_guard.dart';
 
 /// 处理 AI / 外部唤起的 Deep Link（URL Scheme: kgka://）。
 ///
@@ -62,7 +63,13 @@ class DeepLinkService {
         if (query != null && query.trim().isNotEmpty) {
           final songs = await api.searchSongs(query.trim(), pageSize: 10);
           if (songs.isNotEmpty) {
-            await player.playSong(songs.first, queue: songs);
+            // 外部唤起按 externalLink 过闸门：疑似外放态（只连通话
+            // 通道的蓝牙/路由未确认）拒绝，防网页/第三方 App 静默外放。
+            await player.playSong(
+              songs.first,
+              queue: songs,
+              playOrigin: PlayOrigin.externalLink,
+            );
           }
         }
       } else if (actionHost == 'control') {
@@ -76,13 +83,13 @@ class DeepLinkService {
             await player.previous();
             break;
           case 'play':
-            await player.play();
+            await player.play(origin: PlayOrigin.externalLink);
             break;
           case 'pause':
             await player.pause();
             break;
           case 'toggle':
-            await player.togglePlay();
+            await player.togglePlay(origin: PlayOrigin.externalLink);
             break;
         }
       }
