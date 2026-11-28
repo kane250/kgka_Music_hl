@@ -25,7 +25,7 @@ const _callOnlyBluetooth = AudioRouteSnapshot(
 const _unknown = AudioRouteSnapshot.unknown();
 
 void main() {
-  group('decide: I3/I4 用户显式播放永远放行', () {
+  group('decide: I3/I4 用户显式播放不被静默吞掉', () {
     test('焦点被永久抢占时 userTap 仍放行（B1 死锁修复）', () {
       final guard = PlaybackGuard();
       guard.recordInterruptionBegin(
@@ -34,6 +34,26 @@ void main() {
         currentRoute: _bluetooth,
       );
       expect(guard.decide(PlayOrigin.userTap, _speaker), PlayDecision.allow);
+    });
+
+    test('来电（transient）中 userTap 推迟到焦点归还，不强行起播', () {
+      final guard = PlaybackGuard();
+      guard.recordInterruptionBegin(
+        InterruptionPhase.transient,
+        wasPlaying: true,
+        currentRoute: _bluetooth,
+      );
+      expect(guard.decide(PlayOrigin.userTap, _bluetooth), PlayDecision.defer);
+    });
+
+    test('duck 只压音量不拦用户播放', () {
+      final guard = PlaybackGuard();
+      guard.recordInterruptionBegin(
+        InterruptionPhase.ducked,
+        wasPlaying: true,
+        currentRoute: _bluetooth,
+      );
+      expect(guard.decide(PlayOrigin.userTap, _bluetooth), PlayDecision.allow);
     });
 
     test('断连暂停后 userTap 仍放行', () {
@@ -268,7 +288,7 @@ void main() {
   });
 
   group('recordUserPlay', () {
-    test('清除用户/断连暂停状态（但不清除焦点）', () {
+    test('清除用户/断连暂停状态（但不清除打断恢复资格）', () {
       final guard = PlaybackGuard();
       guard.recordPause(PauseCause.disconnect, _bluetooth);
       guard.recordUserPlay();
@@ -276,13 +296,14 @@ void main() {
       expect(guard.decide(PlayOrigin.automatic, _bluetooth), PlayDecision.allow);
     });
 
-    test('打断暂停在用户播放后清除', () {
+    test('来电中用户点歌：打断恢复资格保留，焦点归还后可接管意图', () {
       final guard = PlaybackGuard();
       guard.recordInterruptionBegin(
         InterruptionPhase.transient,
-        wasPlaying: true,
+        wasPlaying: false,
         currentRoute: _bluetooth,
       );
+      // 用户点歌不清除打断状态（区别于用户暂停）。
       guard.recordUserPlay();
       expect(guard.lastPause, isNull);
     });

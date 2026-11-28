@@ -136,11 +136,18 @@ class PlaybackGuard extends ChangeNotifier {
   /// 焦点阶段在 [recordUserPlay] 后由调用方配合 setActive(true)，
   /// 收到 gain 后经 [recordInterruptionEnd] 清除。若平台不回调 gain，
   /// 调用方可在申请成功后手动置 [clearFocus]。
+  /// 用户显式播放入口的安全清理（I3/I4）。
+  ///
+  /// 只清除「用户暂停」与「断连暂停」两类挂起（需要解锁的状态）。
+  /// 打断恢复资格（interruption）保留：来电中用户点歌的表达的意图
+  /// 由焦点归还后的恢复流程接管，否则用户点歌会被否。
+  ///
+  /// 焦点阶段不在此时清除：permanent 丢失由用户播放重新申请焦点解决，
+  /// transient 期间用户播放会被 defer 到焦点归还（见 [decide]）。
   void recordUserPlay() {
-    if (_lastPause != null) {
+    if (_lastPause == PauseCause.user || _lastPause == PauseCause.disconnect) {
       _lastPause = null;
       _routeAtPause = null;
-      _resumeAfterInterruption = false;
       notifyListeners();
     }
   }
@@ -182,6 +189,18 @@ class PlaybackGuard extends ChangeNotifier {
     }
   }
 
+  /// 外部设备回连（旧 devices 分支）时解除「断连暂停」挂起。
+  ///
+  /// 与 [recordRouteReady] 的区别：本方法不判断路由一致性，
+  /// 由调用方在设备事件语义下使用（设备已重新出现即视为安全上下文重建）。
+  void resolveDisconnectHold() {
+    if (_lastPause == PauseCause.disconnect) {
+      _lastPause = null;
+      _routeAtPause = null;
+      notifyListeners();
+    }
+  }
+
   /// 外部输出路由重新确认可用（设备回连/插入）。
   ///
   /// 返回是否解除了「断连暂停」的挂起（即此前因断连暂停、且该设备
@@ -207,9 +226,16 @@ class PlaybackGuard extends ChangeNotifier {
   ///
   /// 这是全应用唯一判断「现在能不能播放」的函数（I5）。
   PlayDecision decide(PlayOrigin origin, AudioRouteSnapshot route) {
-    // I3/I4：用户的显式操作永远放行。焦点占用对用户不可见地
-    // 由 recordUserPlay + 重新申请焦点处理，绝不静默吞掉用户的点击。
     if (origin == PlayOrigin.userTap) {
+      // I3/I4：用户的显式操作不因路由/断连被拦（那些挂起已在
+      // recordUserPlay 中清除）。但来电等瞬时打断（transient）下
+      // 强行起播会被系统立即再次暂停，推迟到焦点归还更可靠；
+      // permanent 丢失没有 end 事件，若 defer 会重现 B1 死锁，
+      // 因此允许：由用户播放重新申请焦点（setActive）解锁。
+      // ducked 只压低音量，不阻止用户播放。
+      if (_focus == InterruptionPhase.transient) {
+        return PlayDecision.defer;
+      }
       return PlayDecision.allow;
     }
 

@@ -14,6 +14,7 @@ import 'package:kgka_music_hl/models/music_models.dart';
 import 'package:kgka_music_hl/services/cache_service.dart';
 import 'package:kgka_music_hl/services/music_api.dart';
 import 'package:kgka_music_hl/services/music_audio_handler.dart';
+import 'package:kgka_music_hl/services/playback_guard.dart';
 import 'package:kgka_music_hl/ui/pages/home_page.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -21,6 +22,8 @@ class _Session extends Fake implements AudioSession {
   final interruptions = StreamController<AudioInterruptionEvent>.broadcast();
   final noisy = StreamController<void>.broadcast();
   final devices = StreamController<Set<AudioDevice>>.broadcast();
+  final devicesChanged =
+      StreamController<AudioDevicesChangedEvent>.broadcast();
 
   @override
   Stream<AudioInterruptionEvent> get interruptionEventStream =>
@@ -29,6 +32,9 @@ class _Session extends Fake implements AudioSession {
   Stream<void> get becomingNoisyEventStream => noisy.stream;
   @override
   Stream<Set<AudioDevice>> get devicesStream => devices.stream;
+  @override
+  Stream<AudioDevicesChangedEvent> get devicesChangedEventStream =>
+      devicesChanged.stream;
   @override
   Future<void> configure(AudioSessionConfiguration configuration) async {}
   @override
@@ -48,6 +54,7 @@ class _Session extends Fake implements AudioSession {
     await interruptions.close();
     await noisy.close();
     await devices.close();
+    await devicesChanged.close();
   }
 }
 
@@ -110,6 +117,12 @@ class _Handler extends Fake implements MusicAudioHandler {
   Completer<void>? sourceLoad;
   Completer<void>? pendingSeek;
   Completer<void>? pendingPlay;
+  PlayDecision Function(PlayOrigin origin)? gate;
+
+  @override
+  void attachPlaybackGate(PlayDecision Function(PlayOrigin origin) decide) {
+    gate = decide;
+  }
   @override
   Song? loadedSong;
 
@@ -160,12 +173,30 @@ class _Handler extends Fake implements MusicAudioHandler {
   }
 
   @override
-  Future<void> play({bool userInitiated = true}) async {
-    if (userInitiated) {
+  Future<void> play({PlayOrigin origin = PlayOrigin.systemMedia}) async {
+    // 与真实 MusicAudioHandler 一致：系统直达的请求也要过闸门；
+    // 外部 userTap 过闸后同步 transport 回调（controller 的用户意图）。
+    final decision = gate?.call(origin);
+    if (decision != null && decision != PlayDecision.allow) {
+      return;
+    }
+    if (origin == PlayOrigin.userTap) {
       _onPlay?.call();
     } else {
       automaticPlays++;
     }
+    audioPlayer.setPlaying(true);
+    await pendingPlay?.future;
+  }
+
+  /// controller 内部起播：过闸门、计数，但不触发 transport 回调。
+  @override
+  Future<void> playInternal(PlayOrigin origin) async {
+    final decision = gate?.call(origin);
+    if (decision != null && decision != PlayDecision.allow) {
+      return;
+    }
+    automaticPlays++;
     audioPlayer.setPlaying(true);
     await pendingPlay?.future;
   }
@@ -210,6 +241,7 @@ class _HomePlayer extends ChangeNotifier implements PlayerController {
     bool preservePersonalFmSession = false,
     QueueOrigin? origin,
     bool userInitiated = true,
+    PlayOrigin? playOrigin,
   }) async {
     requestedSong = song;
     requestedQueue = queue;
@@ -414,7 +446,7 @@ void main() {
       handler.audioPlayer.setPlaying(true);
       session.noisy.add(null);
       await Future<void>.delayed(Duration.zero);
-      await handler.play();
+      await handler.play(origin: PlayOrigin.userTap);
       session.interrupt(true);
       await Future<void>.delayed(Duration.zero);
       session.interrupt(false);

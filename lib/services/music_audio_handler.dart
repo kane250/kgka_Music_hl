@@ -8,6 +8,8 @@ import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 
 import '../models/music_models.dart';
+import 'audio_route_monitor.dart';
+import 'playback_guard.dart';
 
 class MusicAudioHandler extends BaseAudioHandler
     with QueueHandler, SeekHandler {
@@ -75,6 +77,19 @@ class MusicAudioHandler extends BaseAudioHandler
     _onPrevious = null;
     _onPause = null;
     _onPlay = null;
+    _gateDecide = null;
+  }
+
+  /// 播放闸门：返回当前来源是否允许出声（B3 修复）。
+  ///
+  /// 系统媒体会话（耳机键/车机 AVRCP/锁屏/通知栏）会直接转发到
+  /// [play]，不经 PlayerController 的任何校验。注入闸门后，
+  /// 与内部调用走同一套决策逻辑。
+  PlayDecision Function(PlayOrigin origin)? _gateDecide;
+
+  /// 由 PlayerController 注入播放闸门。
+  void attachPlaybackGate(PlayDecision Function(PlayOrigin origin) decide) {
+    _gateDecide = decide;
   }
 
   /// 当前歌曲是否已收藏（null 表示未接入收藏能力）。
@@ -276,9 +291,43 @@ class MusicAudioHandler extends BaseAudioHandler
 
   int _playSessionId = 0;
 
+  /// 唯一播放入口。
+  ///
+  /// [origin] 标识播放请求来源：默认为 [PlayOrigin.systemMedia]，
+  /// 即未经审查的调用方（系统媒体会话、未来新增入口）一律按系统来源
+  /// 过闸门——只在路由安全时才放行，修复系统入口绕过断连/打断保护的
+  /// 问题（B3）。外部直通的用户显式播放（[PlayOrigin.userTap]）
+  /// 过闸后还会触发 transport 回调同步 controller 的用户意图。
+  ///
+  /// controller 内部起播统一走 [playInternal]（不重复触发回调）。
+  ///
+  /// 闸门拒绝时静默返回（defer/deny 均丢掉本次请求，后续路由/焦点
+  /// 事件会重新触发）；拒绝原因写入日志供定位。
   @override
-  Future<void> play({bool userInitiated = true}) async {
-    if (userInitiated) _onPlay?.call();
+  Future<void> play({PlayOrigin origin = PlayOrigin.systemMedia}) async {
+    await _play(origin, internal: false);
+  }
+
+  /// controller 内部统一起播入口。
+  ///
+  /// 用户意图（解锁断连挂起等）已在 controller 的公开入口处理，
+  /// 这里只过闸门与执行起播。
+  Future<void> playInternal(PlayOrigin origin) async {
+    await _play(origin, internal: true);
+  }
+
+  Future<void> _play(PlayOrigin origin, {required bool internal}) async {
+    final gate = _gateDecide;
+    if (gate != null) {
+      final decision = gate(origin);
+      if (decision != PlayDecision.allow) {
+        debugPrint(
+          '[KA Music][gate] handler.play(${origin.name}) -> ${decision.name}',
+        );
+        return;
+      }
+    }
+    if (!internal && origin == PlayOrigin.userTap) _onPlay?.call();
     final sessionId = ++_playSessionId;
     Object? lastError;
 
