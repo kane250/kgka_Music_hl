@@ -1133,6 +1133,34 @@ void main() {
       expect(routeHandler.audioPlayer.playing, isTrue);
     });
 
+    test('引擎被动停止且无任何系统事件时兜底记录断连（真机 B2 场景）',
+        () async {
+      await Future<void>.delayed(Duration.zero);
+      routeSession.addBluetoothMediaDevice();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      routeHandler.audioPlayer.setPlaying(true);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(routeHandler.audioPlayer.playing, isTrue);
+
+      // 真机实测场景：MIUI 拔蓝牙不发 becomingNoisy、设备事件缺席，
+      // AudioTrack 被系统直接停掉——引擎被动暂停，无任何归因来源。
+      routeSession.currentDevices = {};
+      routeHandler.audioPlayer.setPlaying(false);
+      // 等待被动暂停探测完成权威路由查询与归因。
+      await Future<void>.delayed(const Duration(milliseconds: 500));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 断连挂起生效：系统媒体入口 PLAY（车机/媒体键）不得起播外放。
+      await routeHandler.play();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(routeHandler.audioPlayer.playing, isFalse);
+
+      // 用户显式播放解除挂起并正常起播。
+      await routePlayer.play();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      expect(routeHandler.audioPlayer.playing, isTrue);
+    });
+
     test('断连暂停跨重启：恢复自启动不自动播放（B6）', () async {
       await Future<void>.delayed(Duration.zero);
       routeSession.addBluetoothMediaDevice();

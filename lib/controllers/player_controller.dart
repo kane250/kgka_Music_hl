@@ -305,12 +305,20 @@ class PlayerController extends ChangeNotifier {
       notifyListeners();
     });
     _stateSub = audioPlayer.playerStateStream.listen((value) {
+      final wasPlaying = isPlaying;
       isPlaying = value.playing;
       isBuffering =
           value.processingState == ProcessingState.loading ||
           value.processingState == ProcessingState.buffering;
       if (!_isSeeking) {
         _setPositionBase(audioPlayer.position, playing: isPlaying);
+      }
+      // 引擎在无本应用暂停请求的情况下停止：极可能是系统因路由变化
+      // （拔耳机/蓝牙断开）直接停掉 AudioTrack（MIUI 等不发 becomingNoisy
+      // 且设备事件可能缺席）。真机实测发现这条被动路径会让断连完全
+      // 无归因，媒体键 PLAY 被放行到扬声器外放——必须在此完成归因。
+      if (!value.playing && wasPlaying) {
+        unawaited(_detectUnexpectedEnginePause());
       }
       _syncListeningTimeTracker();
       _syncDesktopPlayState();
@@ -870,7 +878,7 @@ class PlayerController extends ChangeNotifier {
       if (requestSerial != _playRequestSerial) return;
       debugPrint('[KA Music][playback] request=$requestSerial failed: $error');
       errorMessage = error.toString();
-      unawaited(_audioHandler.pause());
+      unawaited(_enginePause());
       notifyListeners();
     } finally {
       _finishSourceChange(requestSerial);
@@ -1517,7 +1525,7 @@ class PlayerController extends ChangeNotifier {
   Future<void> togglePlay({PlayOrigin origin = PlayOrigin.userTap}) async {
     _cancelAutomaticResume();
     if (audioPlayer.playing) {
-      await _audioHandler.pause();
+      await _enginePause();
       // 暂停瞬间落盘一次进度：用户经常暂停后直接退出，5 秒定时器
       // 可能还没触发，位置会停留在上一次保存点。
       _saveCurrentPosition();
@@ -1717,7 +1725,7 @@ class PlayerController extends ChangeNotifier {
         _sleepFinishCurrentSongOption = false;
         sleepTimerRemaining = null;
         notifyListeners();
-        unawaited(_audioHandler.pause());
+        unawaited(_enginePause());
         return;
       }
 
@@ -1948,7 +1956,7 @@ class PlayerController extends ChangeNotifier {
               wasPlaying: wasPlaying,
               currentRoute: route,
             );
-            unawaited(_audioHandler.pause(userInitiated: false));
+            unawaited(_enginePause(userInitiated: false));
           } else if (wasPlaying) {
             // 阻止打断模式：不暂停、不标记焦点阶段；闸门在焦点 none 下
             // 放行，这里只负责把可能被系统层掐断的播放拉回来。
@@ -2008,6 +2016,7 @@ class PlayerController extends ChangeNotifier {
   ///
   /// becomingNoisy 快通道与设备移除兜底通道共用；重复触发幂等。
   void _handleRouteAbandoned(String source) {
+    debugPrint('[KA Music][gate] route abandoned ($source)');
     final route = _currentRouteSnapshot();
     if (autoPauseOnDeviceDisconnect) {
       // 断开即暂停（默认开启）：立即停下并记录「因断连暂停」。
@@ -2015,7 +2024,7 @@ class PlayerController extends ChangeNotifier {
       // （I1/B2/B4/B6）。
       _cancelAutomaticResume();
       // 先暂停再恢复 duck 音量，避免拔耳机瞬间满音量爆音（B8）。
-      unawaited(_audioHandler.pause(userInitiated: false));
+      unawaited(_enginePause(userInitiated: false));
       _restoreDuckedVolume();
       _guard.recordPause(PauseCause.disconnect, route);
       // B6：跨进程持久化，重启后的自启动流程不得在扬声器上恢复。
@@ -2029,7 +2038,7 @@ class PlayerController extends ChangeNotifier {
     final wasPlaying =
         audioPlayer.playing ||
         _pendingPlaybackIntent == _playbackIntentSerial;
-    unawaited(_audioHandler.pause(userInitiated: false));
+    unawaited(_enginePause(userInitiated: false));
     if (wasPlaying) {
       // 兼容旧行为：按打断语义记录，随后可恢复（含在扬声器上恢复，
       // 这是用户显式关闭「断开停止播放」后选择的行为）。
@@ -2049,7 +2058,9 @@ class PlayerController extends ChangeNotifier {
   ///    修复旧实现「设备出现≠路由生效/SCO 输入也触发」的缺陷；
   /// 3. 车机歌词公告：设备就绪后主动刷新（#161）。
   void _handleRouteReady(AudioRouteChange change) {
+    debugPrint('[KA Music][gate] route ready -> ${change.snapshot.short}');
     final disconnectResolved = _guard.recordRouteReady(change.snapshot);
+    debugPrint('[KA Music][gate] routeReady resolved=$disconnectResolved');
 
     // 断连暂停后的自动续播（含 B4 的 deferred 唤醒）。
     if (disconnectResolved &&
@@ -2071,6 +2082,47 @@ class PlayerController extends ChangeNotifier {
     // 再延迟补发一次，避免第二次连接后一直收不到歌词（#161）。
     _announceBluetoothLyrics();
     _scheduleBluetoothLyricsAnnouncement();
+  }
+
+  /// 统一的引擎暂停出口：打上「本应用主动暂停」时间戳，
+  /// 供 [_detectUnexpectedEnginePause] 区分系统被动暂停。
+  Future<void> _enginePause({bool userInitiated = true}) async {
+    _lastSelfPauseAt = DateTime.now();
+    await _audioHandler.pause(userInitiated: userInitiated);
+  }
+
+  /// 最近一次由本应用主动发起的暂停时间。
+  DateTime? _lastSelfPauseAt;
+
+  /// 引擎在无本应用暂停请求的情况下停止（真机实测 MIUI 拔蓝牙不发
+  /// becomingNoisy、设备事件也可能缺席，AudioTrack 被系统直接停掉）。
+  ///
+  /// 处理：主动向系统做一次权威路由查询（getDevices），若已无外部
+  /// 媒体输出，则按「断连暂停」归因——阻断后续一切自动/系统来源的
+  /// 扬声器外放（B2/B3 的最后一道兜底）。
+  Future<void> _detectUnexpectedEnginePause() async {
+    // 已有明确归因（用户暂停/断连/打断记录在先）时不覆盖。
+    if (_guard.lastPause != null) return;
+    // 我们自己刚发起的暂停（含其状态回调延迟到达）。
+    final selfPauseAt = _lastSelfPauseAt;
+    if (selfPauseAt != null &&
+        DateTime.now().difference(selfPauseAt) < const Duration(seconds: 3)) {
+      return;
+    }
+    debugPrint('[KA Music][gate] unexpected engine pause; probing route');
+    final snapshot = await _routeMonitor.refresh();
+    if (snapshot.known && !snapshot.hasExternalOutput) {
+      debugPrint(
+        '[KA Music][gate] route lost external output -> disconnect hold',
+      );
+      _cancelAutomaticResume();
+      _guard.recordPause(PauseCause.disconnect, snapshot);
+      _persistDisconnectPause(true);
+    } else {
+      debugPrint(
+        '[KA Music][gate] unexpected pause, route=${snapshot.short} (no action)',
+      );
+    }
   }
 
   void _cancelAutomaticResume() {
@@ -2687,7 +2739,7 @@ class PlayerController extends ChangeNotifier {
     notifyListeners();
     // 睡眠定时到点：按完成语义记录，阻断其后一切自动恢复。
     _guard.recordPause(PauseCause.completion, _currentRouteSnapshot());
-    unawaited(_audioHandler.pause());
+    unawaited(_enginePause());
   }
 
   Future<void> _restoreSettings() async {

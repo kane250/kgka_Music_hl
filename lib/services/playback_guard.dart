@@ -253,6 +253,15 @@ class PlaybackGuard extends ChangeNotifier {
   ///
   /// 这是全应用唯一判断「现在能不能播放」的函数（I5）。
   PlayDecision decide(PlayOrigin origin, AudioRouteSnapshot route) {
+    final decision = _decide(origin, route);
+    debugPrint(
+      '[KA Music][gate] decide(${origin.name}, ${route.short}) '
+      '-> ${decision.name} (focus=$_focus, lastPause=$_lastPause)',
+    );
+    return decision;
+  }
+
+  PlayDecision _decide(PlayOrigin origin, AudioRouteSnapshot route) {
     if (origin == PlayOrigin.userTap) {
       // I3/I4：用户的显式操作不因路由/断连被拦（那些挂起已在
       // recordUserPlay 中清除）。但来电等瞬时打断（transient）下

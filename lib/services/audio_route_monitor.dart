@@ -205,12 +205,18 @@ class AudioRouteMonitor {
   /// 设备事件（added 确认/removed 剔除）驱动。
   void _handleBecomingNoisy() {
     if (_disposed) return;
+    debugPrint('[KA Music][route] becomingNoisy received');
     _additionConfirm?.cancel();
     _emitAbandoned('becomingNoisy');
   }
 
   void _handleDevicesChanged(AudioDevicesChangedEvent event) {
     if (_disposed) return;
+    debugPrint(
+      '[KA Music][route] devicesChanged '
+      'added=${event.devicesAdded.map((d) => d.type.name).join(',')} '
+      'removed=${event.devicesRemoved.map((d) => d.type.name).join(',')}',
+    );
     final removedExternal = event.devicesRemoved.any(isMediaOutput);
     final addedOutput = event.devicesAdded.any((d) => d.isOutput);
 
@@ -246,6 +252,10 @@ class AudioRouteMonitor {
   /// abandoned（避免多设备切换误暂停）；若全部移除：广播 abandoned。
   void _applyRemoval(Set<String> removedIds) {
     final remaining = _current.externalDeviceIds.difference(removedIds);
+    debugPrint(
+      '[KA Music][route] applyRemoval removed=${removedIds.join(',')} '
+      'remaining=${remaining.length}',
+    );
     final snapshot = AudioRouteSnapshot(
       known: true,
       hasExternalOutput: remaining.isNotEmpty,
@@ -268,6 +278,9 @@ class AudioRouteMonitor {
       reason: AudioRouteChangeReason.snapshot,
     );
     if (_disposed) return;
+    debugPrint(
+      '[KA Music][route] addition confirmed -> ${snapshot.short}',
+    );
     if (snapshot.known && snapshot.hasExternalOutput) {
       _changesController.add(AudioRouteChange(
         snapshot: snapshot,
@@ -301,6 +314,7 @@ class AudioRouteMonitor {
         await session.getDevices(),
       );
       if (_disposed) return _current;
+      debugPrint('[KA Music][route] refresh -> ${snapshot.short}');
       _current = snapshot;
       _changesController.add(AudioRouteChange(
         snapshot: snapshot,
