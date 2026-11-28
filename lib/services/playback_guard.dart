@@ -77,6 +77,13 @@ class PlaybackGuard extends ChangeNotifier {
   AudioRouteSnapshot? _routeAtPause;
   bool _resumeAfterInterruption = false;
 
+  /// 最近一次暂停归因的记录时间。
+  ///
+  /// 用于区分「真实的用户暂停」与「系统转发的 pause 命令」（真机实测
+  /// MIUI 在蓝牙断开时给 MediaSession 补发 pause，两者到达顺序不定）：
+  /// 5 秒内的 user 记录视为系统转发链，断连事件允许覆盖。
+  DateTime? _lastPauseRecordedAt;
+
   /// 当前焦点占用阶段。
   InterruptionPhase get focus => _focus;
 
@@ -166,31 +173,47 @@ class PlaybackGuard extends ChangeNotifier {
   /// 断连暂停保存路由快照供 routeReady 后的一致性恢复；
   /// 打断暂停仅在当前无更具体原因时记录。
   void recordPause(PauseCause cause, AudioRouteSnapshot currentRoute) {
+    final now = DateTime.now();
     if (cause == PauseCause.user) {
       // 真机实测（PR#1 验收）：MIUI/AVRCP 在蓝牙断开时会给
       // MediaSession 补发一条 pause 命令，经 handler 默认参数被
-      // 当成「用户暂停」——若据此改写归因，断连保护立即失效，
-      // 随后的媒体键 PLAY 被放行到扬声器外放。
-      // 断连挂起一经建立，只有用户显式播放（recordUserPlay）
-      // 可以解除，系统转发的暂停命令不得覆盖。
+      // 当成「用户暂停」。若已建立断连挂起，直接忽略。
       if (_lastPause == PauseCause.disconnect) {
         debugPrint(
           '[KA Music][gate] user pause ignored (disconnect hold active)',
         );
         return;
       }
+      debugPrint('[KA Music][gate] pause recorded: user');
       _resumeAfterInterruption = false;
       _lastPause = cause;
+      _lastPauseRecordedAt = now;
       _routeAtPause = currentRoute;
       notifyListeners();
       return;
     }
-    // 已有用户暂停，绝不允许后续系统事件改写为可自动恢复的原因。
-    if (_lastPause == PauseCause.user) return;
     if (cause == PauseCause.disconnect) {
+      // 竞态修复（真机实测）：MIUI 转发的 pause 命令可能先于
+      // becomingNoisy/设备事件到达，先把 lastPause 记成 user，
+      // 导致断连归因被「用户暂停不可改写」挡住、挂起建立失败、
+      // 媒体键 PLAY 被放行到扬声器外放。
+      // 5 秒内记录的 user 视为系统转发链的一部分，允许断连覆盖；
+      // 更早的用户暂停是真实意图，保持不变（重连后不自动恢复）。
+      final recentUserPause =
+          _lastPause == PauseCause.user &&
+          _lastPauseRecordedAt != null &&
+          now.difference(_lastPauseRecordedAt!) <
+              const Duration(seconds: 5);
+      if (_lastPause == PauseCause.user && !recentUserPause) {
+        debugPrint(
+          '[KA Music][gate] disconnect ignored (real user pause)',
+        );
+        return;
+      }
       final previousPause = _lastPause;
       _resumeAfterInterruption = false;
       _lastPause = cause;
+      _lastPauseRecordedAt = now;
       // 通话中耳机断开：保留打断开始时的路由快照（耳机上），
       // 它是「通话结束+耳机回连后恢复」的判断依据（B4），
       // 不能被断连时刻的（已失去外部输出的）快照覆盖。
@@ -201,12 +224,17 @@ class PlaybackGuard extends ChangeNotifier {
       if (!preserveInterruptionRoute) {
         _routeAtPause = currentRoute;
       }
+      debugPrint('[KA Music][gate] pause recorded: disconnect');
       notifyListeners();
       return;
     }
+    // 已有用户暂停，绝不允许后续系统事件改写为可自动恢复的原因。
+    if (_lastPause == PauseCause.user) return;
     if (_lastPause == null) {
       _lastPause = cause;
+      _lastPauseRecordedAt = now;
       _routeAtPause = currentRoute;
+      debugPrint('[KA Music][gate] pause recorded: $cause');
       notifyListeners();
     }
   }
